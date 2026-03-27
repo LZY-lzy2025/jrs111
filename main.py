@@ -11,7 +11,7 @@ import urllib.parse
 import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from flask import Flask, send_file, render_template_string
+from flask import Flask, send_file, render_template_string, request, jsonify
 
 # --- 配置区 ---
 SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
@@ -87,12 +87,10 @@ def decrypt_id_to_url(encrypted_id):
         pad = 4 - (len(decoded_id) % 4)
         if pad != 4: decoded_id += "=" * pad
         
-        # 对应 JS: atob() -> base64 解码为 latin1 字符串
         bin_str = base64.b64decode(decoded_id).decode('latin1')
         decrypted_bin = xxtea_decrypt(bin_str, TARGET_KEY)
         
         if decrypted_bin:
-            # 对应 JS: decodeURIComponent(escape(str)) -> 解决中文乱码
             json_str = decrypted_bin.encode('latin1').decode('utf-8')
             data = json.loads(json_str)
             return data.get("url")
@@ -100,7 +98,6 @@ def decrypt_id_to_url(encrypted_id):
         print(f"解密失败: {e}")
     return None
 # ==========================================
-
 
 def get_html_from_js(js_url):
     try:
@@ -112,6 +109,7 @@ def get_html_from_js(js_url):
         return ""
 
 def extract_from_resource_tree(page):
+    """从页面提取加密 ID"""
     for frame in page.frames:
         if 'paps.html?id=' in frame.url:
             return frame.url.split('paps.html?id=')[-1]
@@ -137,7 +135,7 @@ def generate_playlist():
     current_year = now.year
     
     m3u_lines = ["#EXTM3U\n"]
-    txt_dict = {} # 用于将 txt 按 JRS-联赛名 分组整理
+    txt_dict = {} 
 
     try:
         with sync_playwright() as p:
@@ -150,14 +148,13 @@ def generate_playlist():
                     time_tag = match.find('li', class_='lab_time')
                     if not time_tag: continue
                     
-                    match_time_raw = time_tag.text.strip() # 例: 03-20 00:00
+                    match_time_raw = time_tag.text.strip() 
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
                     if abs((match_dt - now).total_seconds()) / 3600 > 3:
                         continue
 
-                    # 1. 抓取联赛名、时间、对阵双方
                     league_tag = match.find('li', class_='lab_events')
                     league_name = league_tag.find('span', class_='name').text.strip() if league_tag else "综合"
                     group_name = f"JRS-{league_name}"
@@ -183,6 +180,7 @@ def generate_playlist():
                     play_path = None
                     for a in detail_soup.find_all('a', class_='item ok me'):
                         a_text = a.text.strip()
+                        # 放宽关键字匹配规则
                         if '高清' in a_text or '蓝光' in a_text:
                             play_path = a.get('data-play')
                             break
@@ -190,25 +188,26 @@ def generate_playlist():
                     if not play_path: continue
 
                     final_url = f"{BASE_URL}{play_path}"
+                    print(f"正在分析: {final_url}")
                     
-                    page.goto(final_url, wait_until="networkidle", timeout=15000)
+                    # 采用更稳健的加载策略：加载完成并强制等待3秒，防止防盗链长连接导致 networkidle 超时
+                    page.goto(final_url, wait_until="load", timeout=15000)
+                    page.wait_for_timeout(3000)
+
                     encrypted_id = extract_from_resource_tree(page)
 
                     if encrypted_id:
-                        # 2. 拿到加密 ID，执行 XXTEA 解密，获得直接播放地址
                         real_stream_url = decrypt_id_to_url(encrypted_id)
                         
                         if real_stream_url:
-                            # M3U 追加 (自带分组 group-title 属性)
                             m3u_lines.append(f'#EXTINF:-1 tvg-name="{channel_name}" group-title="{group_name}",{channel_name}\n')
                             m3u_lines.append(f'{real_stream_url}\n')
                             
-                            # TXT 追加到对应分组字典
                             if group_name not in txt_dict:
                                 txt_dict[group_name] = []
                             txt_dict[group_name].append(f"{channel_name},{real_stream_url}")
                             
-                            print(f"成功获取并解密: [{group_name}] {channel_name}")
+                            print(f"成功获取: [{group_name}] {channel_name}")
 
                 except Exception as e:
                     print(f"解析比赛出错: {e}")
@@ -225,12 +224,12 @@ def generate_playlist():
         
     with open(OUTPUT_TXT_FILE, 'w', encoding='utf-8') as f:
         for group, channels in txt_dict.items():
-            f.write(f"{group},#genre#\n")  # TXT 格式的分组头
+            f.write(f"{group},#genre#\n")
             for ch in channels:
                 f.write(f"{ch}\n")
     
     last_update_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    print("播放列表(M3U/TXT)已更新完成。")
+    print("播放列表已更新完成。")
 
 
 # --- Web 管理后台路由 ---
@@ -248,6 +247,7 @@ def index():
             .btn { display: inline-block; margin: 10px; padding: 12px 24px; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
             .btn-blue { background-color: #007bff; }
             .btn-green { background-color: #28a745; }
+            .btn-dark { background-color: #343a40; font-size: 12px; padding: 8px 16px;}
         </style>
     </head>
     <body>
@@ -258,6 +258,9 @@ def index():
             <div style="margin-top: 20px;">
                 <a href="/m3u" class="btn btn-blue">获取 M3U 订阅</a>
                 <a href="/txt" class="btn btn-green">获取 TXT 订阅</a>
+            </div>
+            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+                <p style="font-size: 12px; color: #666;">遇到了抓不到的链接？使用 Debug 工具排查：<br><code>/debug?url=播放页URL</code></p>
             </div>
         </div>
     </body>
@@ -278,6 +281,50 @@ def get_txt():
         return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
     except FileNotFoundError:
         return "TXT 文件尚未生成，请稍后再试。", 404
+
+@app.route('/debug')
+def debug_url():
+    """手动调试抓取单条 URL，用于排查 wlive.php 等棘手链接"""
+    target_url = request.args.get('url')
+    if not target_url:
+        return jsonify({"error": "请提供 url 参数，例如 /debug?url=http://play..."}), 400
+
+    debug_info = {
+        "target_url": target_url, "extracted_token": None, "decrypted_url": None,
+        "frames_found": [], "resources_found": [], "error": None
+    }
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            page = browser.new_page()
+
+            # 强制等待 3 秒，防止长轮询卡住进程
+            page.goto(target_url, wait_until="load", timeout=15000)
+            page.wait_for_timeout(3000) 
+
+            for frame in page.frames:
+                debug_info["frames_found"].append(frame.url)
+                if 'paps.html?id=' in frame.url and not debug_info["extracted_token"]:
+                    debug_info["extracted_token"] = frame.url.split('paps.html?id=')[-1]
+
+            resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
+            debug_info["resources_found"] = resource_urls
+            
+            if not debug_info["extracted_token"]:
+                for url in resource_urls:
+                    if 'paps.html?id=' in url:
+                        debug_info["extracted_token"] = url.split('paps.html?id=')[-1]
+                        break
+
+            if debug_info["extracted_token"]:
+                debug_info["decrypted_url"] = decrypt_id_to_url(debug_info["extracted_token"])
+
+            browser.close()
+    except Exception as e:
+        debug_info["error"] = str(e)
+
+    return jsonify(debug_info)
 
 def run_scheduler():
     schedule.every(1).hours.do(generate_playlist)
