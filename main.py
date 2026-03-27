@@ -18,7 +18,6 @@ SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
 BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
 OUTPUT_TXT_FILE = "/app/output/playlist.txt"
-CACHE_FILE = "/app/output/streams_cache.json"
 TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # ------------------
 
@@ -112,22 +111,42 @@ def extract_from_resource_tree(page):
     return None
 
 
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
-        return []
+def load_existing_entries_from_m3u():
+    entries = []
+    if not os.path.exists(OUTPUT_M3U_FILE):
+        return entries
+
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
+        with open(OUTPUT_M3U_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
     except Exception:
-        return []
+        return entries
 
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#EXTINF:") and i + 1 < len(lines):
+            stream_url = lines[i + 1]
+            channel_name = ""
+            group_name = "JRS-未分组"
 
-def save_cache(cache_items):
-    tmp_cache = CACHE_FILE + ".tmp"
-    with open(tmp_cache, "w", encoding="utf-8") as f:
-        json.dump(cache_items, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_cache, CACHE_FILE)
+            if "," in line:
+                channel_name = line.split(",", 1)[-1].strip()
+
+            group_match = re.search(r'group-title="([^"]+)"', line)
+            if group_match:
+                group_name = group_match.group(1).strip()
+
+            if channel_name and stream_url.startswith("http"):
+                entries.append({
+                    "group_name": group_name,
+                    "channel_name": channel_name,
+                    "stream_url": stream_url,
+                })
+            i += 2
+            continue
+        i += 1
+    return entries
 
 # ==========================================
 # 静默版爬虫主流程
@@ -150,12 +169,12 @@ def generate_playlist():
         return
 
     current_year = now.year
-    cache_items = load_cache()
-    cached_keys = {item.get("source_key") for item in cache_items if item.get("source_key")}
+    existing_entries = load_existing_entries_from_m3u()
+    existing_channel_names = {item["channel_name"] for item in existing_entries}
 
     m3u_lines = ["#EXTM3U\n"]
     txt_dict = {}
-    for item in cache_items:
+    for item in existing_entries:
         group_name = item["group_name"]
         specific_channel_name = item["channel_name"]
         real_stream_url = item["stream_url"]
@@ -228,9 +247,7 @@ def generate_playlist():
                     for line_info in target_lines:
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
-                        source_key = f"{match_dt.isoformat()}|{specific_channel_name}|{final_url}"
-
-                        if source_key in cached_keys:
+                        if specific_channel_name in existing_channel_names:
                             skip_count += 1
                             continue
                         
@@ -249,13 +266,12 @@ def generate_playlist():
                                     if group_name not in txt_dict: txt_dict[group_name] = []
                                     txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
 
-                                    cache_items.append({
+                                    existing_channel_names.add(specific_channel_name)
+                                    existing_entries.append({
                                         "group_name": group_name,
                                         "channel_name": specific_channel_name,
                                         "stream_url": real_stream_url,
-                                        "source_key": source_key,
                                     })
-                                    cached_keys.add(source_key)
                                     
                                     success_count += 1
                         except Exception:
@@ -272,7 +288,7 @@ def generate_playlist():
     # 核心机制：原子写入防冲突
     # ==========================================
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
-    if len(cache_items) == 0:
+    if len(existing_entries) == 0:
         m3u_lines.append("# 当前时间段无可用直播\n")
         txt_dict["System"] = ["No streams,http://127.0.0.1/error.mp4"]
 
@@ -290,10 +306,9 @@ def generate_playlist():
     # 2. 瞬间替换掉旧文件，确保播放器读取零卡顿、无空白期
     os.replace(tmp_m3u, OUTPUT_M3U_FILE)
     os.replace(tmp_txt, OUTPUT_TXT_FILE)
-    save_cache(cache_items)
     
     finish_time = datetime.datetime.now(tz)
-    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. New {success_count} lines, skipped {skip_count} cached lines, total {len(cache_items)} lines.")
+    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. New {success_count} lines, skipped {skip_count} existing lines, total {len(existing_entries)} lines.")
 
 
 # ==========================================
