@@ -13,19 +13,26 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from flask import Flask, send_file, render_template_string, request, jsonify
 
-# --- 配置区 ---
+# --- 全局配置区 ---
 SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
-BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
 OUTPUT_TXT_FILE = "/app/output/playlist.txt"
 TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
-# --------------
+# ------------------
 
 app = Flask(__name__)
 last_update_time = "尚未更新"
 
+# 用于在网页端实时显示抓取状态
+crawler_status = {
+    "total_matches": 0,
+    "in_time_matches": 0,
+    "success_lines": 0,
+    "current_action": "等待启动..."
+}
+
 # ==========================================
-# 核心：内置轻量级 XXTEA 解密算法 (纯 Python 翻译版)
+# 核心一：内置轻量级 XXTEA 解密算法
 # ==========================================
 def str2long(s):
     v = []
@@ -50,8 +57,7 @@ def xxtea_decrypt(data, key):
     if not data: return ""
     v = str2long(data)
     k = str2long(key)
-    while len(k) < 4:
-        k.append(0)
+    while len(k) < 4: k.append(0)
     
     n = len(v) - 1
     if n < 1: return ""
@@ -75,60 +81,63 @@ def xxtea_decrypt(data, key):
 
     m = v[-1]
     limit = (len(v) - 1) << 2
-    if m < limit - 3 or m > limit:
-        return None
-    res = long2str(v)
-    return res[:m]
+    if m < limit - 3 or m > limit: return None
+    return long2str(v)[:m]
 
 def decrypt_id_to_url(encrypted_id):
-    """解码并提取真实的播放地址"""
+    """Base64解码 -> XXTEA解密 -> 提取真实流链接"""
     try:
         decoded_id = urllib.parse.unquote(encrypted_id)
         pad = 4 - (len(decoded_id) % 4)
         if pad != 4: decoded_id += "=" * pad
-        
         bin_str = base64.b64decode(decoded_id).decode('latin1')
         decrypted_bin = xxtea_decrypt(bin_str, TARGET_KEY)
-        
         if decrypted_bin:
             json_str = decrypted_bin.encode('latin1').decode('utf-8')
-            data = json.loads(json_str)
-            return data.get("url")
+            return json.loads(json_str).get("url")
     except Exception as e:
-        print(f"解密失败: {e}")
+        print(f"解密出错: {e}")
     return None
-# ==========================================
 
+# ==========================================
+# 核心二：底层资产提取逻辑
+# ==========================================
 def get_html_from_js(js_url):
     try:
         response = requests.get(js_url, timeout=10)
         response.encoding = 'utf-8'
         return "".join(re.findall(r"document\.write\('(.*?)'\);", response.text))
-    except Exception as e:
-        print(f"获取 JS 文件失败: {e}")
+    except Exception:
         return ""
 
 def extract_from_resource_tree(page):
-    """从页面资产或框架树中提取加密 ID"""
+    # 1. 查 Frame 嵌套
     for frame in page.frames:
         if 'paps.html?id=' in frame.url:
             return frame.url.split('paps.html?id=')[-1]
-
-    resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
-    for url in resource_urls:
+    # 2. 查浏览器性能加载树
+    for url in page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)"):
         if 'paps.html?id=' in url:
             return url.split('paps.html?id=')[-1]
     return None
 
+# ==========================================
+# 核心三：爬虫主流程
+# ==========================================
 def generate_playlist():
-    global last_update_time
-    print(f"[{datetime.datetime.now()}] 开始执行全量高清线路抓取任务...")
+    global last_update_time, crawler_status
+    crawler_status["current_action"] = "正在获取赛程列表..."
+    crawler_status["success_lines"] = 0
+    crawler_status["in_time_matches"] = 0
     
     html_content = get_html_from_js(SOURCE_URL)
-    if not html_content: return
+    if not html_content: 
+        crawler_status["current_action"] = "获取赛程失败，等待重试"
+        return
 
     soup = BeautifulSoup(html_content, 'html.parser')
     matches = soup.find_all('ul', class_='item play d-touch active')
+    crawler_status["total_matches"] = len(matches)
     
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.datetime.now(tz)
@@ -140,8 +149,7 @@ def generate_playlist():
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = browser.new_context()
-            page = context.new_page()
+            page = browser.new_page()
             
             for match in matches:
                 try:
@@ -152,110 +160,103 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    if abs((match_dt - now).total_seconds()) / 3600 > 3:
+                    # 时间过滤器：前后 12 小时
+                    if abs((match_dt - now).total_seconds()) / 3600 > 12:
                         continue
-
+                    
+                    crawler_status["in_time_matches"] += 1
+                    
+                    # 组装频道名称与分组
                     league_tag = match.find('li', class_='lab_events')
                     league_name = league_tag.find('span', class_='name').text.strip() if league_tag else "综合"
                     group_name = f"JRS-{league_name}"
-                    
                     home_team = match.find('li', class_='lab_team_home').find('strong').text.strip()
                     away_team = match.find('li', class_='lab_team_away').find('strong').text.strip()
-                    
                     base_channel_name = f"{match_time_raw} {home_team} VS {away_team}"
 
+                    # 寻找主播放页链接
                     channel_li = match.find('li', class_='lab_channel')
                     target_link = None
                     if channel_li:
                         for a_tag in channel_li.find_all('a', href=True):
-                            if 'play.sportsteam368.com' in a_tag['href']:
-                                target_link = a_tag['href']
+                            href_val = a_tag['href']
+                            if 'http' in href_val and '/play/' in href_val:
+                                target_link = href_val
                                 break
                     
                     if not target_link: continue
 
-                    detail_resp = requests.get(target_link, timeout=10)
+                    # 伪装请求主播放页，防止被盾拦截导致抓不到 data-play
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                    detail_resp = requests.get(target_link, headers=headers, timeout=10)
                     detail_soup = BeautifulSoup(detail_resp.text, 'html.parser')
                     
-                    # 1. 收集所有优质线路
+                    # 收集所有高质量线路
                     target_lines = []
                     for a in detail_soup.find_all('a', class_='item ok me'):
                         a_text = a.text.strip()
-                        current_data_play = a.get('data-play')
-                        
-                        if not current_data_play: continue
-                        
-                        # 包含高清、蓝光、原画的线路全量收录
-                        if '高清' in a_text or '蓝光' in a_text or '原画' in a_text:
-                            target_lines.append({
-                                "line_name": a_text,
-                                "path": current_data_play
-                            })
+                        data_play = a.get('data-play')
+                        if data_play and ('高清' in a_text or '蓝光' in a_text or '原画' in a_text):
+                            target_lines.append({"name": a_text, "path": data_play})
                     
-                    if not target_lines: 
-                        continue
-
-                    # 2. 遍历抓取所有符合条件的线路
-                    success_count = 0
+                    # 遍历解析每一条找到的高质量线路
                     for line_info in target_lines:
-                        line_name = line_info["line_name"]
-                        play_path = line_info["path"]
-                        final_url = f"{BASE_URL}{play_path}"
-                        specific_channel_name = f"{base_channel_name} - {line_name}"
-                        
-                        print(f"正在分析: [{specific_channel_name}]")
+                        # 安全拼接 URL
+                        final_url = urllib.parse.urljoin(target_link, line_info['path'])
+                        specific_channel_name = f"{base_channel_name} - {line_info['name']}"
+                        crawler_status["current_action"] = f"正在解析: {specific_channel_name}"
                         
                         try:
+                            # 强力延时：保证多层 iframe 彻底挂载
                             page.goto(final_url, wait_until="load", timeout=15000)
                             page.wait_for_timeout(3000)
-
+                            
                             encrypted_id = extract_from_resource_tree(page)
 
                             if encrypted_id:
                                 real_stream_url = decrypt_id_to_url(encrypted_id)
-                                
                                 if real_stream_url:
+                                    # 写入 M3U
                                     m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
                                     m3u_lines.append(f'{real_stream_url}\n')
-                                    
-                                    if group_name not in txt_dict:
-                                        txt_dict[group_name] = []
+                                    # 写入 TXT 缓存
+                                    if group_name not in txt_dict: txt_dict[group_name] = []
                                     txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
                                     
-                                    success_count += 1
-                                    print(f"✅ 成功提取: {specific_channel_name}")
-                                    
+                                    crawler_status["success_lines"] += 1
+                                    print(f"✅ 成功入库: {specific_channel_name}")
                         except Exception as e:
-                            print(f"❌ 线路 {line_name} 提取超时或报错: {e}")
+                            print(f"❌ 线路失败: {specific_channel_name} - {e}")
                             continue
-                            
-                    if success_count == 0:
-                        print(f"⚠️ [{base_channel_name}] 的所有高清线路均提取失败。")
 
                 except Exception as e:
-                    print(f"解析比赛出错: {e}")
+                    print(f"解析某场比赛出错: {e}")
                     continue
             
             browser.close()
     except Exception as e:
-        print(f"运行出错: {e}")
+        crawler_status["current_action"] = f"严重错误: {e}"
 
-    # 写入文件
+    # 结果落盘
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
+    if crawler_status["success_lines"] == 0:
+        # 如果什么都没抓到，留个防空提示，避免播放器报错
+        m3u_lines.append("# 当前时间段没有抓取到符合条件的直播源\n")
+        txt_dict["系统提示"] = ["当前无比赛或全部解析失败,http://127.0.0.1/error.mp4"]
+
     with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
         f.writelines(m3u_lines)
-        
     with open(OUTPUT_TXT_FILE, 'w', encoding='utf-8') as f:
         for group, channels in txt_dict.items():
             f.write(f"{group},#genre#\n")
-            for ch in channels:
-                f.write(f"{ch}\n")
+            for ch in channels: f.write(f"{ch}\n")
     
     last_update_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    print("播放列表已更新完成。")
+    crawler_status["current_action"] = "抓取完成，等待下一次运行 (休眠中)"
 
-
-# --- Web 管理后台路由 ---
+# ==========================================
+# 核心四：Web 管理与 API
+# ==========================================
 @app.route('/')
 def index():
     html = """
@@ -266,84 +267,74 @@ def index():
         <meta charset="utf-8">
         <style>
             body { font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 40px; text-align: center; }
-            .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+            .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
             .btn { display: inline-block; margin: 10px; padding: 12px 24px; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
             .btn-blue { background-color: #007bff; }
             .btn-green { background-color: #28a745; }
+            .status-box { background: #e9ecef; padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; font-size: 14px; }
+            .status-box span { font-weight: bold; color: #333; }
+            .action-text { color: #d63384; font-weight: bold; }
         </style>
+        <meta http-equiv="refresh" content="10">
     </head>
     <body>
         <div class="container">
             <h2>IPTV 自动化抓取系统</h2>
-            <p>系统状态: <span style="color: green; font-weight: bold;">运行中 🟢</span></p>
-            <p>最后更新: <strong>{{ last_update }}</strong></p>
-            <div style="margin-top: 20px;">
+            <div class="status-box">
+                <p>🕒 最后更新时间: <span>{{ last_update }}</span></p>
+                <p>📡 爬虫当前动作: <span class="action-text">{{ status.current_action }}</span></p>
+                <hr>
+                <p>🔍 发现总比赛数: <span>{{ status.total_matches }}</span> 场</p>
+                <p>⏳ 在时间范围内: <span>{{ status.in_time_matches }}</span> 场 (±12小时)</p>
+                <p>✅ 成功解密线路: <span style="color: #198754; font-size: 18px;">{{ status.success_lines }}</span> 条</p>
+            </div>
+            <div>
                 <a href="/m3u" class="btn btn-blue">获取 M3U 订阅</a>
                 <a href="/txt" class="btn btn-green">获取 TXT 订阅</a>
             </div>
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
-                <p style="font-size: 12px; color: #666;">测试特定链接，请使用 Debug 工具：<br><code>/debug?url=网页链接</code></p>
-            </div>
+            <p style="font-size: 12px; color: #888; margin-top: 20px;">遇到了顽固死链？使用排障工具：<br><code>/debug?url=网页链接</code></p>
         </div>
     </body>
     </html>
     """
-    return render_template_string(html, last_update=last_update_time)
+    return render_template_string(html, last_update=last_update_time, status=crawler_status)
 
 @app.route('/m3u')
 def get_m3u():
-    try:
-        return send_file(OUTPUT_M3U_FILE, mimetype='application/vnd.apple.mpegurl', as_attachment=False)
-    except FileNotFoundError:
-        return "M3U 文件尚未生成，请稍后再试。", 404
+    try: return send_file(OUTPUT_M3U_FILE, mimetype='application/vnd.apple.mpegurl', as_attachment=False)
+    except FileNotFoundError: return "文件尚未生成，请稍后再试", 404
 
 @app.route('/txt')
 def get_txt():
-    try:
-        return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
-    except FileNotFoundError:
-        return "TXT 文件尚未生成，请稍后再试。", 404
+    try: return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
+    except FileNotFoundError: return "文件尚未生成，请稍后再试", 404
 
 @app.route('/debug')
 def debug_url():
     target_url = request.args.get('url')
-    if not target_url:
-        return jsonify({"error": "请提供 url 参数，例如 /debug?url=http://play..."}), 400
-
-    debug_info = {
-        "target_url": target_url, "extracted_token": None, "decrypted_url": None,
-        "frames_found": [], "resources_found": [], "error": None
-    }
-
+    if not target_url: return jsonify({"error": "请提供 url"}), 400
+    debug_info = {"target_url": target_url, "extracted_token": None, "decrypted_url": None, "frames_found": [], "resources_found": []}
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             page = browser.new_page()
-
             page.goto(target_url, wait_until="load", timeout=15000)
             page.wait_for_timeout(3000) 
-
-            for frame in page.frames:
-                debug_info["frames_found"].append(frame.url)
-                if 'paps.html?id=' in frame.url and not debug_info["extracted_token"]:
-                    debug_info["extracted_token"] = frame.url.split('paps.html?id=')[-1]
-
+            
+            for f in page.frames:
+                debug_info["frames_found"].append(f.url)
+                if 'paps.html?id=' in f.url: debug_info["extracted_token"] = f.url.split('paps.html?id=')[-1]
+            
             resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
             debug_info["resources_found"] = resource_urls
             
             if not debug_info["extracted_token"]:
                 for url in resource_urls:
-                    if 'paps.html?id=' in url:
-                        debug_info["extracted_token"] = url.split('paps.html?id=')[-1]
-                        break
-
-            if debug_info["extracted_token"]:
-                debug_info["decrypted_url"] = decrypt_id_to_url(debug_info["extracted_token"])
-
+                    if 'paps.html?id=' in url: debug_info["extracted_token"] = url.split('paps.html?id=')[-1]; break
+            
+            if debug_info["extracted_token"]: debug_info["decrypted_url"] = decrypt_id_to_url(debug_info["extracted_token"])
             browser.close()
-    except Exception as e:
-        debug_info["error"] = str(e)
-
+    except Exception as e: debug_info["error"] = str(e)
     return jsonify(debug_info)
 
 def run_scheduler():
@@ -353,9 +344,6 @@ def run_scheduler():
         time.sleep(30)
 
 if __name__ == "__main__":
-    # 启动抓取和定时任务
     threading.Thread(target=generate_playlist, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
-    
-    # 启动 Web 管理后台
     app.run(host="0.0.0.0", port=80)
