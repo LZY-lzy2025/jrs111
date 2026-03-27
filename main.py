@@ -11,7 +11,7 @@ import urllib.parse
 import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from flask import Flask, send_file, render_template_string, request, jsonify
+from flask import Flask, send_file, request, jsonify
 
 # --- 全局配置区 ---
 SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
@@ -22,17 +22,9 @@ TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # ------------------
 
 app = Flask(__name__)
-last_update_time = "尚未更新"
-
-crawler_status = {
-    "total_matches": 0,
-    "in_time_matches": 0,
-    "success_lines": 0,
-    "current_action": "等待启动..."
-}
 
 # ==========================================
-# 核心一：内置轻量级 XXTEA 解密算法
+# 内置轻量级 XXTEA 解密算法
 # ==========================================
 def str2long(s):
     v = []
@@ -94,12 +86,12 @@ def decrypt_id_to_url(encrypted_id):
         if decrypted_bin:
             json_str = decrypted_bin.encode('latin1').decode('utf-8')
             return json.loads(json_str).get("url")
-    except Exception as e:
-        print(f"解密出错: {e}")
+    except Exception:
+        pass
     return None
 
 # ==========================================
-# 核心二：底层资产提取
+# 底层资产提取
 # ==========================================
 def get_html_from_js(js_url):
     try:
@@ -119,40 +111,32 @@ def extract_from_resource_tree(page):
     return None
 
 # ==========================================
-# 核心三：爬虫主流程
+# 静默版爬虫主流程
 # ==========================================
 def generate_playlist():
-    global last_update_time, crawler_status
-    print(f"\n[{datetime.datetime.now()}] 🚀 开始执行全量高清线路抓取任务...")
-    crawler_status["current_action"] = "正在获取赛程列表..."
-    crawler_status["success_lines"] = 0
-    crawler_status["in_time_matches"] = 0
+    tz = pytz.timezone('Asia/Shanghai')
+    now = datetime.datetime.now(tz)
+    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Task started.")
     
     html_content = get_html_from_js(SOURCE_URL)
     if not html_content: 
-        print("❌ 获取 JS 数据源失败，请检查网络或 URL 是否有效。")
-        crawler_status["current_action"] = "获取赛程失败，等待重试"
+        print("Task aborted: Source unreadable.")
         return
 
     soup = BeautifulSoup(html_content, 'html.parser')
     matches = soup.select('ul.item.play')
-    print(f"🔍 分析网页：共找到 {len(matches)} 场比赛大类。")
-    crawler_status["total_matches"] = len(matches)
     
     if len(matches) == 0:
-        print("⚠️ 警告：提取到的比赛数量为 0！网页结构可能发生了改变。")
+        print("Task aborted: No items found.")
         return
 
-    tz = pytz.timezone('Asia/Shanghai')
-    now = datetime.datetime.now(tz)
     current_year = now.year
-    
     m3u_lines = ["#EXTM3U\n"]
     txt_dict = {} 
+    success_count = 0
 
     try:
         with sync_playwright() as p:
-            print("🌐 正在启动 Playwright 浏览器内核...")
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             page = browser.new_page()
             
@@ -165,16 +149,10 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # ==========================================
-                    # 【核心更新】：时间过滤器：前三小时，后一小时
-                    # time_diff_hours 为负代表过去的比赛，为正代表未来的比赛
-                    # ==========================================
+                    # 时间过滤器：前三小时，后一小时
                     time_diff_hours = (match_dt - now).total_seconds() / 3600
                     if not (-3 <= time_diff_hours <= 1):
-                        print(f"⏩ 过滤: [{match_time_raw}] 距今约 {time_diff_hours:.1f} 小时，不在提取范围内，已跳过。")
                         continue
-                    
-                    crawler_status["in_time_matches"] += 1
                     
                     league_tag = match.find('li', class_='lab_events')
                     league_name = league_tag.find('span', class_='name').text.strip() if league_tag else "综合"
@@ -194,13 +172,11 @@ def generate_playlist():
                     
                     if not target_link: continue
 
-                    crawler_status["current_action"] = f"请求详情页: {base_channel_name}"
                     try:
                         page.goto(target_link, wait_until="load", timeout=15000)
                         page.wait_for_timeout(2000)
                         detail_html = page.content()
-                    except Exception as e:
-                        print(f"   ✖ [{base_channel_name}] 访问详情页超时或失败。")
+                    except Exception:
                         continue
 
                     detail_soup = BeautifulSoup(detail_html, 'html.parser')
@@ -214,13 +190,11 @@ def generate_playlist():
                             target_lines.append({"name": a_text, "path": data_play})
                     
                     if not target_lines: 
-                        print(f"   ✖ [{base_channel_name}] 详情页抓到 {len(all_lines)} 条线路，但未匹配到高清标识。")
                         continue
 
                     for line_info in target_lines:
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
-                        crawler_status["current_action"] = f"正在解析: {specific_channel_name}"
                         
                         try:
                             page.goto(final_url, wait_until="load", timeout=15000)
@@ -237,29 +211,22 @@ def generate_playlist():
                                     if group_name not in txt_dict: txt_dict[group_name] = []
                                     txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
                                     
-                                    crawler_status["success_lines"] += 1
-                                    print(f"✅ 成功入库: {specific_channel_name}")
-                                else:
-                                    print(f"   ⚠️ [{specific_channel_name}] 解密失败。")
-                            else:
-                                print(f"   ⚠️ [{specific_channel_name}] 资产树提取失败。")
-                        except Exception as e:
-                            print(f"   ❌ 线路请求报错: {specific_channel_name} - {e}")
+                                    success_count += 1
+                        except Exception:
                             continue
 
-                except Exception as e:
-                    print(f"解析比赛报错: {e}")
+                except Exception:
                     continue
             
             browser.close()
     except Exception as e:
-        print(f"\n🚨🚨 严重错误！Playwright 启动失败: {e}")
-        crawler_status["current_action"] = f"严重错误: {e}"
+        print(f"Task encountered an error: {e}")
 
+    # 写入文件
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
-    if crawler_status["success_lines"] == 0:
-        m3u_lines.append("# 当前时间段没有抓取到符合条件的直播源\n")
-        txt_dict["系统提示"] = ["当前无比赛或全部解析失败,http://127.0.0.1/error.mp4"]
+    if success_count == 0:
+        m3u_lines.append("# No streams available at this time\n")
+        txt_dict["System"] = ["No streams,http://127.0.0.1/error.mp4"]
 
     with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
         f.writelines(m3u_lines)
@@ -268,69 +235,32 @@ def generate_playlist():
             f.write(f"{group},#genre#\n")
             for ch in channels: f.write(f"{ch}\n")
     
-    last_update_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    crawler_status["current_action"] = "抓取完成，等待下一次运行 (休眠中)"
-    print(f"\n[{last_update_time}] 🏁 列表更新完成。共提取到 {crawler_status['success_lines']} 条高清线路。")
+    finish_time = datetime.datetime.now(tz)
+    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. Extracted {success_count} lines.")
 
 # ==========================================
-# 核心四：Web 管理与 API
+# 极简 Web 路由 (防扫描)
 # ==========================================
 @app.route('/')
 def index():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>IPTV 抓取管理后台</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 40px; text-align: center; }
-            .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
-            .btn { display: inline-block; margin: 10px; padding: 12px 24px; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
-            .btn-blue { background-color: #007bff; }
-            .btn-green { background-color: #28a745; }
-            .status-box { background: #e9ecef; padding: 15px; border-radius: 8px; margin: 20px 0; text-align: left; font-size: 14px; }
-            .status-box span { font-weight: bold; color: #333; }
-            .action-text { color: #d63384; font-weight: bold; }
-        </style>
-        <meta http-equiv="refresh" content="10">
-    </head>
-    <body>
-        <div class="container">
-            <h2>IPTV 自动化抓取系统</h2>
-            <div class="status-box">
-                <p>🕒 最后更新时间: <span>{{ last_update }}</span></p>
-                <p>📡 爬虫当前动作: <span class="action-text">{{ status.current_action }}</span></p>
-                <hr>
-                <p>🔍 发现总比赛数: <span>{{ status.total_matches }}</span> 场</p>
-                <p>⏳ 在时间范围内: <span>{{ status.in_time_matches }}</span> 场 (前3~后1小时)</p>
-                <p>✅ 成功解密线路: <span style="color: #198754; font-size: 18px;">{{ status.success_lines }}</span> 条</p>
-            </div>
-            <div>
-                <a href="/m3u" class="btn btn-blue">获取 M3U 订阅</a>
-                <a href="/txt" class="btn btn-green">获取 TXT 订阅</a>
-            </div>
-            <p style="font-size: 12px; color: #888; margin-top: 20px;">遇到了顽固死链？使用排障工具：<br><code>/debug?url=网页链接</code></p>
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(html, last_update=last_update_time, status=crawler_status)
+    # 伪装成一个毫无特征的正常接口，防止平台风控扫描
+    return "Service OK", 200
 
 @app.route('/m3u')
 def get_m3u():
     try: return send_file(OUTPUT_M3U_FILE, mimetype='application/vnd.apple.mpegurl', as_attachment=False)
-    except FileNotFoundError: return "文件尚未生成，请稍后再试", 404
+    except FileNotFoundError: return "File not found", 404
 
 @app.route('/txt')
 def get_txt():
     try: return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
-    except FileNotFoundError: return "文件尚未生成，请稍后再试", 404
+    except FileNotFoundError: return "File not found", 404
 
+# 保留 debug 接口用于你需要时手动排障，它需要带参数才起作用，扫描器一般扫不出
 @app.route('/debug')
 def debug_url():
     target_url = request.args.get('url')
-    if not target_url: return jsonify({"error": "请提供 url"}), 400
+    if not target_url: return "Bad Request", 400
     debug_info = {"target_url": target_url, "extracted_token": None, "decrypted_url": None, "frames_found": [], "resources_found": []}
     try:
         with sync_playwright() as p:
@@ -364,4 +294,9 @@ def run_scheduler():
 if __name__ == "__main__":
     threading.Thread(target=generate_playlist, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
+    # 移除 Flask 自带的开发服务器警告输出，更加静默
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
     app.run(host="0.0.0.0", port=80)
