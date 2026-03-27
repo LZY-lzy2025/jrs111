@@ -109,7 +109,7 @@ def get_html_from_js(js_url):
         return ""
 
 def extract_from_resource_tree(page):
-    """从页面提取加密 ID"""
+    """从页面资产或框架树中提取加密 ID"""
     for frame in page.frames:
         if 'paps.html?id=' in frame.url:
             return frame.url.split('paps.html?id=')[-1]
@@ -122,7 +122,7 @@ def extract_from_resource_tree(page):
 
 def generate_playlist():
     global last_update_time
-    print(f"[{datetime.datetime.now()}] 开始执行抓取任务...")
+    print(f"[{datetime.datetime.now()}] 开始执行全量高清线路抓取任务...")
     
     html_content = get_html_from_js(SOURCE_URL)
     if not html_content: return
@@ -162,7 +162,7 @@ def generate_playlist():
                     home_team = match.find('li', class_='lab_team_home').find('strong').text.strip()
                     away_team = match.find('li', class_='lab_team_away').find('strong').text.strip()
                     
-                    channel_name = f"{match_time_raw} {home_team} VS {away_team}"
+                    base_channel_name = f"{match_time_raw} {home_team} VS {away_team}"
 
                     channel_li = match.find('li', class_='lab_channel')
                     target_link = None
@@ -177,37 +177,60 @@ def generate_playlist():
                     detail_resp = requests.get(target_link, timeout=10)
                     detail_soup = BeautifulSoup(detail_resp.text, 'html.parser')
                     
-                    play_path = None
+                    # 1. 收集所有优质线路
+                    target_lines = []
                     for a in detail_soup.find_all('a', class_='item ok me'):
                         a_text = a.text.strip()
-                        # 放宽关键字匹配规则
-                        if '高清' in a_text or '蓝光' in a_text:
-                            play_path = a.get('data-play')
-                            break
-                    
-                    if not play_path: continue
-
-                    final_url = f"{BASE_URL}{play_path}"
-                    print(f"正在分析: {final_url}")
-                    
-                    # 采用更稳健的加载策略：加载完成并强制等待3秒，防止防盗链长连接导致 networkidle 超时
-                    page.goto(final_url, wait_until="load", timeout=15000)
-                    page.wait_for_timeout(3000)
-
-                    encrypted_id = extract_from_resource_tree(page)
-
-                    if encrypted_id:
-                        real_stream_url = decrypt_id_to_url(encrypted_id)
+                        current_data_play = a.get('data-play')
                         
-                        if real_stream_url:
-                            m3u_lines.append(f'#EXTINF:-1 tvg-name="{channel_name}" group-title="{group_name}",{channel_name}\n')
-                            m3u_lines.append(f'{real_stream_url}\n')
+                        if not current_data_play: continue
+                        
+                        # 包含高清、蓝光、原画的线路全量收录
+                        if '高清' in a_text or '蓝光' in a_text or '原画' in a_text:
+                            target_lines.append({
+                                "line_name": a_text,
+                                "path": current_data_play
+                            })
+                    
+                    if not target_lines: 
+                        continue
+
+                    # 2. 遍历抓取所有符合条件的线路
+                    success_count = 0
+                    for line_info in target_lines:
+                        line_name = line_info["line_name"]
+                        play_path = line_info["path"]
+                        final_url = f"{BASE_URL}{play_path}"
+                        specific_channel_name = f"{base_channel_name} - {line_name}"
+                        
+                        print(f"正在分析: [{specific_channel_name}]")
+                        
+                        try:
+                            page.goto(final_url, wait_until="load", timeout=15000)
+                            page.wait_for_timeout(3000)
+
+                            encrypted_id = extract_from_resource_tree(page)
+
+                            if encrypted_id:
+                                real_stream_url = decrypt_id_to_url(encrypted_id)
+                                
+                                if real_stream_url:
+                                    m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
+                                    m3u_lines.append(f'{real_stream_url}\n')
+                                    
+                                    if group_name not in txt_dict:
+                                        txt_dict[group_name] = []
+                                    txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
+                                    
+                                    success_count += 1
+                                    print(f"✅ 成功提取: {specific_channel_name}")
+                                    
+                        except Exception as e:
+                            print(f"❌ 线路 {line_name} 提取超时或报错: {e}")
+                            continue
                             
-                            if group_name not in txt_dict:
-                                txt_dict[group_name] = []
-                            txt_dict[group_name].append(f"{channel_name},{real_stream_url}")
-                            
-                            print(f"成功获取: [{group_name}] {channel_name}")
+                    if success_count == 0:
+                        print(f"⚠️ [{base_channel_name}] 的所有高清线路均提取失败。")
 
                 except Exception as e:
                     print(f"解析比赛出错: {e}")
@@ -247,7 +270,6 @@ def index():
             .btn { display: inline-block; margin: 10px; padding: 12px 24px; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
             .btn-blue { background-color: #007bff; }
             .btn-green { background-color: #28a745; }
-            .btn-dark { background-color: #343a40; font-size: 12px; padding: 8px 16px;}
         </style>
     </head>
     <body>
@@ -260,7 +282,7 @@ def index():
                 <a href="/txt" class="btn btn-green">获取 TXT 订阅</a>
             </div>
             <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
-                <p style="font-size: 12px; color: #666;">遇到了抓不到的链接？使用 Debug 工具排查：<br><code>/debug?url=播放页URL</code></p>
+                <p style="font-size: 12px; color: #666;">测试特定链接，请使用 Debug 工具：<br><code>/debug?url=网页链接</code></p>
             </div>
         </div>
     </body>
@@ -284,7 +306,6 @@ def get_txt():
 
 @app.route('/debug')
 def debug_url():
-    """手动调试抓取单条 URL，用于排查 wlive.php 等棘手链接"""
     target_url = request.args.get('url')
     if not target_url:
         return jsonify({"error": "请提供 url 参数，例如 /debug?url=http://play..."}), 400
@@ -299,7 +320,6 @@ def debug_url():
             browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             page = browser.new_page()
 
-            # 强制等待 3 秒，防止长轮询卡住进程
             page.goto(target_url, wait_until="load", timeout=15000)
             page.wait_for_timeout(3000) 
 
@@ -333,6 +353,9 @@ def run_scheduler():
         time.sleep(30)
 
 if __name__ == "__main__":
+    # 启动抓取和定时任务
     threading.Thread(target=generate_playlist, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
+    
+    # 启动 Web 管理后台
     app.run(host="0.0.0.0", port=80)
