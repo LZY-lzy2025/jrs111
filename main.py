@@ -119,7 +119,7 @@ def extract_from_resource_tree(page):
     return None
 
 # ==========================================
-# 核心三：爬虫主流程 (附带排障日志)
+# 核心三：爬虫主流程
 # ==========================================
 def generate_playlist():
     global last_update_time, crawler_status
@@ -135,8 +135,6 @@ def generate_playlist():
         return
 
     soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # 【修复】：使用更加宽泛的选择器，兼容 'hot' 等额外 class
     matches = soup.select('ul.item.play')
     print(f"🔍 分析网页：共找到 {len(matches)} 场比赛大类。")
     crawler_status["total_matches"] = len(matches)
@@ -167,10 +165,7 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # 【排障】：放宽到前后 24 小时，并打印被过滤的比赛
-                    time_diff_hours = (match_dt - now).total_seconds() / 3600
-                    if abs(time_diff_hours) > 24:
-                        print(f"⏩ 过滤: [{match_time_raw}] 距今约 {abs(time_diff_hours):.1f} 小时，已跳过。")
+                    if abs((match_dt - now).total_seconds()) / 3600 > 24:
                         continue
                     
                     crawler_status["in_time_matches"] += 1
@@ -193,21 +188,36 @@ def generate_playlist():
                     
                     if not target_link: continue
 
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                    detail_resp = requests.get(target_link, headers=headers, timeout=10)
-                    detail_soup = BeautifulSoup(detail_resp.text, 'html.parser')
-                    
+                    # ==========================================
+                    # 【核心修复】：直接用 Playwright 强攻详情页，破除防护盾
+                    # ==========================================
+                    crawler_status["current_action"] = f"请求详情页: {base_channel_name}"
+                    try:
+                        page.goto(target_link, wait_until="load", timeout=15000)
+                        page.wait_for_timeout(2000) # 给防盗链JS缓冲时间
+                        detail_html = page.content()
+                    except Exception as e:
+                        print(f"   ✖ [{base_channel_name}] 访问详情页超时或失败。")
+                        continue
+
+                    detail_soup = BeautifulSoup(detail_html, 'html.parser')
                     target_lines = []
-                    for a in detail_soup.find_all('a', class_='item ok me'):
+                    
+                    # 获取所有带 data-play 的线路
+                    all_lines = detail_soup.select('a[data-play]')
+                    for a in all_lines:
                         a_text = a.text.strip()
                         data_play = a.get('data-play')
                         if data_play and ('高清' in a_text or '蓝光' in a_text or '原画' in a_text):
                             target_lines.append({"name": a_text, "path": data_play})
                     
                     if not target_lines: 
-                        print(f"   ✖ [{base_channel_name}] 详情页未找到符合标识(高清/蓝光)的线路。")
+                        print(f"   ✖ [{base_channel_name}] 详情页抓到 {len(all_lines)} 条线路，但未匹配到高清标识。")
                         continue
 
+                    # ==========================================
+                    # 遍历提取底层资源树
+                    # ==========================================
                     for line_info in target_lines:
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
@@ -244,9 +254,7 @@ def generate_playlist():
             
             browser.close()
     except Exception as e:
-        # 【排障】：如果 Playwright 没装好，这里会大字报错并阻止程序静默失败
         print(f"\n🚨🚨 严重错误！Playwright 启动失败: {e}")
-        print("💡 提示：如果是在本地环境，请确保执行了 `playwright install`")
         crawler_status["current_action"] = f"严重错误: {e}"
 
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
@@ -264,7 +272,6 @@ def generate_playlist():
     last_update_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     crawler_status["current_action"] = "抓取完成，等待下一次运行 (休眠中)"
     print(f"\n[{last_update_time}] 🏁 列表更新完成。共提取到 {crawler_status['success_lines']} 条高清线路。")
-
 
 # ==========================================
 # 核心四：Web 管理与 API
