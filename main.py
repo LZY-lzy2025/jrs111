@@ -110,6 +110,44 @@ def extract_from_resource_tree(page):
             return url.split('paps.html?id=')[-1]
     return None
 
+
+def load_existing_entries_from_m3u():
+    entries = []
+    if not os.path.exists(OUTPUT_M3U_FILE):
+        return entries
+
+    try:
+        with open(OUTPUT_M3U_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except Exception:
+        return entries
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#EXTINF:") and i + 1 < len(lines):
+            stream_url = lines[i + 1]
+            channel_name = ""
+            group_name = "JRS-未分组"
+
+            if "," in line:
+                channel_name = line.split(",", 1)[-1].strip()
+
+            group_match = re.search(r'group-title="([^"]+)"', line)
+            if group_match:
+                group_name = group_match.group(1).strip()
+
+            if channel_name and stream_url.startswith("http"):
+                entries.append({
+                    "group_name": group_name,
+                    "channel_name": channel_name,
+                    "stream_url": stream_url,
+                })
+            i += 2
+            continue
+        i += 1
+    return entries
+
 # ==========================================
 # 静默版爬虫主流程
 # ==========================================
@@ -117,7 +155,7 @@ def generate_playlist():
     tz = pytz.timezone('Asia/Shanghai')
     now = datetime.datetime.now(tz)
     print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Task started.")
-    
+
     html_content = get_html_from_js(SOURCE_URL)
     if not html_content: 
         print("Task aborted: Source unreadable.")
@@ -131,9 +169,23 @@ def generate_playlist():
         return
 
     current_year = now.year
+    existing_entries = load_existing_entries_from_m3u()
+    existing_channel_names = {item["channel_name"] for item in existing_entries}
+
     m3u_lines = ["#EXTM3U\n"]
-    txt_dict = {} 
+    txt_dict = {}
+    for item in existing_entries:
+        group_name = item["group_name"]
+        specific_channel_name = item["channel_name"]
+        real_stream_url = item["stream_url"]
+        m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
+        m3u_lines.append(f"{real_stream_url}\n")
+        if group_name not in txt_dict:
+            txt_dict[group_name] = []
+        txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
+
     success_count = 0
+    skip_count = 0
 
     try:
         with sync_playwright() as p:
@@ -149,7 +201,7 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # 修改点 1：时间过滤器：前4.5小时，后1小时
+                    # 抓取逻辑保持不变：前 4.5 小时，后 1 小时
                     time_diff_hours = (match_dt - now).total_seconds() / 3600
                     if not (-4.5 <= time_diff_hours <= 1):
                         continue
@@ -195,6 +247,9 @@ def generate_playlist():
                     for line_info in target_lines:
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
+                        if specific_channel_name in existing_channel_names:
+                            skip_count += 1
+                            continue
                         
                         try:
                             page.goto(final_url, wait_until="load", timeout=15000)
@@ -210,6 +265,13 @@ def generate_playlist():
                                     
                                     if group_name not in txt_dict: txt_dict[group_name] = []
                                     txt_dict[group_name].append(f"{specific_channel_name},{real_stream_url}")
+
+                                    existing_channel_names.add(specific_channel_name)
+                                    existing_entries.append({
+                                        "group_name": group_name,
+                                        "channel_name": specific_channel_name,
+                                        "stream_url": real_stream_url,
+                                    })
                                     
                                     success_count += 1
                         except Exception:
@@ -226,7 +288,7 @@ def generate_playlist():
     # 核心机制：原子写入防冲突
     # ==========================================
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
-    if success_count == 0:
+    if len(existing_entries) == 0:
         m3u_lines.append("# 当前时间段无可用直播\n")
         txt_dict["System"] = ["No streams,http://127.0.0.1/error.mp4"]
 
@@ -246,7 +308,7 @@ def generate_playlist():
     os.replace(tmp_txt, OUTPUT_TXT_FILE)
     
     finish_time = datetime.datetime.now(tz)
-    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. Extracted {success_count} lines.")
+    print(f"[{finish_time.strftime('%Y-%m-%d %H:%M:%S')}] Task finished. New {success_count} lines, skipped {skip_count} existing lines, total {len(existing_entries)} lines.")
 
 
 # ==========================================
@@ -295,7 +357,7 @@ def debug_url():
     return jsonify(debug_info)
 
 def run_scheduler():
-    # 修改点 2：每 25 分钟运行一次
+    # 每 14 分钟运行一次
     schedule.every(14).minutes.do(generate_playlist)
     while True:
         schedule.run_pending()
