@@ -18,10 +18,28 @@ SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
 BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
 OUTPUT_TXT_FILE = "/app/output/playlist.txt"
+CACHE_FILE = "/app/output/stream_cache.json"  # 新增：用于存放已经抓取过的直链
 TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # ------------------
 
 app = Flask(__name__)
+
+# ==========================================
+# 本地缓存管理 (实现增量抓取)
+# ==========================================
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_cache(cache_data):
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
 # ==========================================
 # 内置轻量级 XXTEA 解密算法
@@ -90,9 +108,6 @@ def decrypt_id_to_url(encrypted_id):
         pass
     return None
 
-# ==========================================
-# 底层资产提取
-# ==========================================
 def get_html_from_js(js_url):
     try:
         response = requests.get(js_url, timeout=10)
@@ -111,7 +126,7 @@ def extract_from_resource_tree(page):
     return None
 
 # ==========================================
-# 静默版爬虫主流程
+# 静默版增量爬虫主流程
 # ==========================================
 def generate_playlist():
     tz = pytz.timezone('Asia/Shanghai')
@@ -135,10 +150,21 @@ def generate_playlist():
     txt_dict = {} 
     success_count = 0
 
+    # 加载已有的缓存
+    stream_cache = load_cache()
+    # 存放本轮有效的缓存（实现自动清理过期数据）
+    new_cache = {}
+
+    # 精准时间区间计算：昨天 20:00 到 今天 23:59:59
+    today_date = now.date()
+    yesterday_date = today_date - datetime.timedelta(days=1)
+    start_dt = tz.localize(datetime.datetime.combine(yesterday_date, datetime.time(20, 0)))
+    end_dt = tz.localize(datetime.datetime.combine(today_date, datetime.time(23, 59, 59)))
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            page = browser.new_page()
+            browser = None
+            page = None
             
             for match in matches:
                 try:
@@ -149,9 +175,8 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    # 时间过滤器：前三小时，后一小时
-                    time_diff_hours = (match_dt - now).total_seconds() / 3600
-                    if not (-3 <= time_diff_hours <= 1):
+                    # 过滤：仅保留昨天20点至今晚24点之间的比赛
+                    if not (start_dt <= match_dt <= end_dt):
                         continue
                     
                     league_tag = match.find('li', class_='lab_events')
@@ -171,6 +196,11 @@ def generate_playlist():
                                 break
                     
                     if not target_link: continue
+
+                    # 如果没有启动浏览器，这里先不启动，因为有可能全命中缓存
+                    if browser is None:
+                        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+                        page = browser.new_page()
 
                     try:
                         page.goto(target_link, wait_until="load", timeout=15000)
@@ -196,6 +226,19 @@ def generate_playlist():
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
                         
+                        # --- 核心：缓存跳过机制 ---
+                        if specific_channel_name in stream_cache:
+                            cached_url = stream_cache[specific_channel_name]
+                            new_cache[specific_channel_name] = cached_url # 续期保留
+                            
+                            m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n{cached_url}\n')
+                            if group_name not in txt_dict: txt_dict[group_name] = []
+                            txt_dict[group_name].append(f"{specific_channel_name},{cached_url}")
+                            
+                            success_count += 1
+                            continue # 直接跳过后续复杂的无头浏览器渲染！
+                        # -------------------------
+                        
                         try:
                             page.goto(final_url, wait_until="load", timeout=15000)
                             page.wait_for_timeout(3000)
@@ -205,6 +248,9 @@ def generate_playlist():
                             if encrypted_id:
                                 real_stream_url = decrypt_id_to_url(encrypted_id)
                                 if real_stream_url:
+                                    # 抓取成功，存入新缓存
+                                    new_cache[specific_channel_name] = real_stream_url
+                                    
                                     m3u_lines.append(f'#EXTINF:-1 tvg-name="{specific_channel_name}" group-title="{group_name}",{specific_channel_name}\n')
                                     m3u_lines.append(f'{real_stream_url}\n')
                                     
@@ -218,13 +264,15 @@ def generate_playlist():
                 except Exception:
                     continue
             
-            browser.close()
+            if browser:
+                browser.close()
+                
     except Exception as e:
         print(f"Task encountered an error: {e}")
 
-    # ==========================================
-    # 核心机制：原子写入防冲突
-    # ==========================================
+    # 保存新的缓存文件（过期的比赛因为没有被加入 new_cache，会被自动丢弃，防止文件无限变大）
+    save_cache(new_cache)
+
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
     if success_count == 0:
         m3u_lines.append("# 当前时间段无可用直播\n")
@@ -233,7 +281,6 @@ def generate_playlist():
     tmp_m3u = OUTPUT_M3U_FILE + ".tmp"
     tmp_txt = OUTPUT_TXT_FILE + ".tmp"
 
-    # 1. 先把数据老老实实写到临时文件里
     with open(tmp_m3u, 'w', encoding='utf-8') as f:
         f.writelines(m3u_lines)
     with open(tmp_txt, 'w', encoding='utf-8') as f:
@@ -241,7 +288,6 @@ def generate_playlist():
             f.write(f"{group},#genre#\n")
             for ch in channels: f.write(f"{ch}\n")
             
-    # 2. 瞬间替换掉旧文件，确保播放器读取零卡顿、无空白期
     os.replace(tmp_m3u, OUTPUT_M3U_FILE)
     os.replace(tmp_txt, OUTPUT_TXT_FILE)
     
@@ -301,16 +347,13 @@ def run_scheduler():
         time.sleep(30)
 
 if __name__ == "__main__":
-    # ==========================================
-    # 核心机制：启动时提前创建占位文件，杜绝 404
-    # ==========================================
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
     if not os.path.exists(OUTPUT_M3U_FILE):
         with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
-            f.write("#EXTM3U\n#EXTINF:-1,系统正在初始化抓取，请稍后(约2分钟)...\nhttp://127.0.0.1/loading.mp4\n")
+            f.write("#EXTM3U\n#EXTINF:-1,系统正在初始化抓取，请稍后...\nhttp://127.0.0.1/loading.mp4\n")
     if not os.path.exists(OUTPUT_TXT_FILE):
         with open(OUTPUT_TXT_FILE, 'w', encoding='utf-8') as f:
-            f.write("系统提示,#genre#\n初始化抓取中(约2分钟)...,http://127.0.0.1/loading.mp4\n")
+            f.write("系统提示,#genre#\n初始化抓取中...,http://127.0.0.1/loading.mp4\n")
 
     threading.Thread(target=generate_playlist, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
