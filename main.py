@@ -6,6 +6,9 @@ import datetime
 import pytz
 import requests
 import schedule
+import base64
+import urllib.parse
+import json
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from flask import Flask, send_file, render_template_string
@@ -14,11 +17,90 @@ from flask import Flask, send_file, render_template_string
 SOURCE_URL = "https://im-imgs-bucket.oss-accelerate.aliyuncs.com/index.js?t_5"
 BASE_URL = "http://play.sportsteam368.com"
 OUTPUT_M3U_FILE = "/app/output/playlist.m3u"
-OUTPUT_TXT_FILE = "/app/output/playlist.txt"  # 新增 TXT 输出路径
+OUTPUT_TXT_FILE = "/app/output/playlist.txt"
+TARGET_KEY = "ABCDEFGHIJKLMNOPQRSTUVWX"
 # --------------
 
 app = Flask(__name__)
 last_update_time = "尚未更新"
+
+# ==========================================
+# 核心：内置轻量级 XXTEA 解密算法 (纯 Python 翻译版)
+# ==========================================
+def str2long(s):
+    v = []
+    for i in range(0, len(s), 4):
+        val = ord(s[i])
+        if i + 1 < len(s): val |= ord(s[i+1]) << 8
+        if i + 2 < len(s): val |= ord(s[i+2]) << 16
+        if i + 3 < len(s): val |= ord(s[i+3]) << 24
+        v.append(val)
+    return v
+
+def long2str(v):
+    s = ""
+    for val in v:
+        s += chr(val & 0xff)
+        s += chr((val >> 8) & 0xff)
+        s += chr((val >> 16) & 0xff)
+        s += chr((val >> 24) & 0xff)
+    return s
+
+def xxtea_decrypt(data, key):
+    if not data: return ""
+    v = str2long(data)
+    k = str2long(key)
+    while len(k) < 4:
+        k.append(0)
+    
+    n = len(v) - 1
+    if n < 1: return ""
+    z = v[n]
+    y = v[0]
+    delta = 0x9E3779B9
+    q = 6 + 52 // (n + 1)
+    sum_val = (q * delta) & 0xffffffff
+
+    while sum_val != 0:
+        e = (sum_val >> 2) & 3
+        for p in range(n, 0, -1):
+            z = v[p - 1]
+            mx = (((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^ ((sum_val ^ y) + (k[(p & 3) ^ e] ^ z))
+            y = v[p] = (v[p] - mx) & 0xffffffff
+        p = 0
+        z = v[n]
+        mx = (((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^ ((sum_val ^ y) + (k[(p & 3) ^ e] ^ z))
+        y = v[0] = (v[0] - mx) & 0xffffffff
+        sum_val = (sum_val - delta) & 0xffffffff
+
+    m = v[-1]
+    limit = (len(v) - 1) << 2
+    if m < limit - 3 or m > limit:
+        return None
+    res = long2str(v)
+    return res[:m]
+
+def decrypt_id_to_url(encrypted_id):
+    """解码并提取真实的播放地址"""
+    try:
+        decoded_id = urllib.parse.unquote(encrypted_id)
+        pad = 4 - (len(decoded_id) % 4)
+        if pad != 4: decoded_id += "=" * pad
+        
+        # 对应 JS: atob() -> base64 解码为 latin1 字符串
+        bin_str = base64.b64decode(decoded_id).decode('latin1')
+        decrypted_bin = xxtea_decrypt(bin_str, TARGET_KEY)
+        
+        if decrypted_bin:
+            # 对应 JS: decodeURIComponent(escape(str)) -> 解决中文乱码
+            json_str = decrypted_bin.encode('latin1').decode('utf-8')
+            data = json.loads(json_str)
+            return data.get("url")
+    except Exception as e:
+        print(f"解密失败: {e}")
+    return None
+# ==========================================
+
 
 def get_html_from_js(js_url):
     try:
@@ -30,18 +112,14 @@ def get_html_from_js(js_url):
         return ""
 
 def extract_from_resource_tree(page):
-    """从网页加载完毕的资源树/框架路径中剥离真实 ID"""
     for frame in page.frames:
         if 'paps.html?id=' in frame.url:
             return frame.url.split('paps.html?id=')[-1]
 
-    resource_urls = page.evaluate("""
-        () => performance.getEntriesByType('resource').map(r => r.name)
-    """)
+    resource_urls = page.evaluate("() => performance.getEntriesByType('resource').map(r => r.name)")
     for url in resource_urls:
         if 'paps.html?id=' in url:
             return url.split('paps.html?id=')[-1]
-
     return None
 
 def generate_playlist():
@@ -49,8 +127,7 @@ def generate_playlist():
     print(f"[{datetime.datetime.now()}] 开始执行抓取任务...")
     
     html_content = get_html_from_js(SOURCE_URL)
-    if not html_content:
-        return
+    if not html_content: return
 
     soup = BeautifulSoup(html_content, 'html.parser')
     matches = soup.find_all('ul', class_='item play d-touch active')
@@ -60,7 +137,7 @@ def generate_playlist():
     current_year = now.year
     
     m3u_lines = ["#EXTM3U\n"]
-    txt_lines = []  # 新增用于存储 TXT 格式的列表
+    txt_dict = {} # 用于将 txt 按 JRS-联赛名 分组整理
 
     try:
         with sync_playwright() as p:
@@ -68,24 +145,27 @@ def generate_playlist():
             context = browser.new_context()
             page = context.new_page()
             
-            # 为了让 txt 列表更好看，我们可以加个分类头
-            txt_lines.append("体育直播,#genre#\n")
-
             for match in matches:
                 try:
                     time_tag = match.find('li', class_='lab_time')
                     if not time_tag: continue
                     
-                    match_time_str = f"{current_year}-{time_tag.text.strip()}"
+                    match_time_raw = time_tag.text.strip() # 例: 03-20 00:00
+                    match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    time_diff = abs((match_dt - now).total_seconds()) / 3600
-                    if time_diff > 3:
+                    if abs((match_dt - now).total_seconds()) / 3600 > 3:
                         continue
 
+                    # 1. 抓取联赛名、时间、对阵双方
+                    league_tag = match.find('li', class_='lab_events')
+                    league_name = league_tag.find('span', class_='name').text.strip() if league_tag else "综合"
+                    group_name = f"JRS-{league_name}"
+                    
                     home_team = match.find('li', class_='lab_team_home').find('strong').text.strip()
                     away_team = match.find('li', class_='lab_team_away').find('strong').text.strip()
-                    match_name = f"{home_team} VS {away_team}"
+                    
+                    channel_name = f"{match_time_raw} {home_team} VS {away_team}"
 
                     channel_li = match.find('li', class_='lab_channel')
                     target_link = None
@@ -110,40 +190,44 @@ def generate_playlist():
                     if not play_path: continue
 
                     final_url = f"{BASE_URL}{play_path}"
-                    print(f"正在分析资源树: {final_url}")
-
+                    
                     page.goto(final_url, wait_until="networkidle", timeout=15000)
-                    token = extract_from_resource_tree(page)
+                    encrypted_id = extract_from_resource_tree(page)
 
-                    if token:
-                        # ⚠️ 注意替换这里的域名前缀
-                        stream_url = f"http://YOUR_PROXY_SERVER_OR_DOMAIN/{token}" 
+                    if encrypted_id:
+                        # 2. 拿到加密 ID，执行 XXTEA 解密，获得直接播放地址
+                        real_stream_url = decrypt_id_to_url(encrypted_id)
                         
-                        # 写入 M3U 格式
-                        m3u_lines.append(f"#EXTINF:-1 tvg-name=\"{match_name}\",{match_name}\n")
-                        m3u_lines.append(f"{stream_url}\n")
-                        
-                        # 写入 TXT 格式 (频道名称,链接)
-                        txt_lines.append(f"{match_name},{stream_url}\n")
-                        
-                        print(f"成功提取: {match_name}")
+                        if real_stream_url:
+                            # M3U 追加 (自带分组 group-title 属性)
+                            m3u_lines.append(f'#EXTINF:-1 tvg-name="{channel_name}" group-title="{group_name}",{channel_name}\n')
+                            m3u_lines.append(f'{real_stream_url}\n')
+                            
+                            # TXT 追加到对应分组字典
+                            if group_name not in txt_dict:
+                                txt_dict[group_name] = []
+                            txt_dict[group_name].append(f"{channel_name},{real_stream_url}")
+                            
+                            print(f"成功获取并解密: [{group_name}] {channel_name}")
 
                 except Exception as e:
-                    print(f"解析单场比赛时出错: {e}")
+                    print(f"解析比赛出错: {e}")
                     continue
             
             browser.close()
     except Exception as e:
-        print(f"Playwright 运行出错: {e}")
+        print(f"运行出错: {e}")
 
-    # 同时写入 M3U 和 TXT 文件
+    # 写入文件
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
-    
     with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
         f.writelines(m3u_lines)
         
     with open(OUTPUT_TXT_FILE, 'w', encoding='utf-8') as f:
-        f.writelines(txt_lines)
+        for group, channels in txt_dict.items():
+            f.write(f"{group},#genre#\n")  # TXT 格式的分组头
+            for ch in channels:
+                f.write(f"{ch}\n")
     
     last_update_time = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     print("播放列表(M3U/TXT)已更新完成。")
@@ -158,16 +242,12 @@ def index():
     <head>
         <title>IPTV 抓取管理后台</title>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body { font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 40px; text-align: center; }
             .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
-            h2 { color: #333; }
             .btn { display: inline-block; margin: 10px; padding: 12px 24px; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
             .btn-blue { background-color: #007bff; }
-            .btn-blue:hover { background-color: #0056b3; }
             .btn-green { background-color: #28a745; }
-            .btn-green:hover { background-color: #218838; }
         </style>
     </head>
     <body>
@@ -192,11 +272,9 @@ def get_m3u():
     except FileNotFoundError:
         return "M3U 文件尚未生成，请稍后再试。", 404
 
-# 新增的 TXT 接口路由
 @app.route('/txt')
 def get_txt():
     try:
-        # 使用 text/plain 确保浏览器会直接显示文字，而不是强制下载（除非用户右键另存为）
         return send_file(OUTPUT_TXT_FILE, mimetype='text/plain', as_attachment=False)
     except FileNotFoundError:
         return "TXT 文件尚未生成，请稍后再试。", 404
