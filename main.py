@@ -165,7 +165,13 @@ def generate_playlist():
                     match_time_str = f"{current_year}-{match_time_raw}"
                     match_dt = tz.localize(datetime.datetime.strptime(match_time_str, "%Y-%m-%d %H:%M"))
                     
-                    if abs((match_dt - now).total_seconds()) / 3600 > 24:
+                    # ==========================================
+                    # 【核心更新】：时间过滤器：前三小时，后一小时
+                    # time_diff_hours 为负代表过去的比赛，为正代表未来的比赛
+                    # ==========================================
+                    time_diff_hours = (match_dt - now).total_seconds() / 3600
+                    if not (-3 <= time_diff_hours <= 1):
+                        print(f"⏩ 过滤: [{match_time_raw}] 距今约 {time_diff_hours:.1f} 小时，不在提取范围内，已跳过。")
                         continue
                     
                     crawler_status["in_time_matches"] += 1
@@ -188,13 +194,10 @@ def generate_playlist():
                     
                     if not target_link: continue
 
-                    # ==========================================
-                    # 【核心修复】：直接用 Playwright 强攻详情页，破除防护盾
-                    # ==========================================
                     crawler_status["current_action"] = f"请求详情页: {base_channel_name}"
                     try:
                         page.goto(target_link, wait_until="load", timeout=15000)
-                        page.wait_for_timeout(2000) # 给防盗链JS缓冲时间
+                        page.wait_for_timeout(2000)
                         detail_html = page.content()
                     except Exception as e:
                         print(f"   ✖ [{base_channel_name}] 访问详情页超时或失败。")
@@ -203,7 +206,6 @@ def generate_playlist():
                     detail_soup = BeautifulSoup(detail_html, 'html.parser')
                     target_lines = []
                     
-                    # 获取所有带 data-play 的线路
                     all_lines = detail_soup.select('a[data-play]')
                     for a in all_lines:
                         a_text = a.text.strip()
@@ -215,9 +217,6 @@ def generate_playlist():
                         print(f"   ✖ [{base_channel_name}] 详情页抓到 {len(all_lines)} 条线路，但未匹配到高清标识。")
                         continue
 
-                    # ==========================================
-                    # 遍历提取底层资源树
-                    # ==========================================
                     for line_info in target_lines:
                         final_url = urllib.parse.urljoin(target_link, line_info['path'])
                         specific_channel_name = f"{base_channel_name} - {line_info['name']}"
@@ -304,7 +303,7 @@ def index():
                 <p>📡 爬虫当前动作: <span class="action-text">{{ status.current_action }}</span></p>
                 <hr>
                 <p>🔍 发现总比赛数: <span>{{ status.total_matches }}</span> 场</p>
-                <p>⏳ 在时间范围内: <span>{{ status.in_time_matches }}</span> 场 (±24小时)</p>
+                <p>⏳ 在时间范围内: <span>{{ status.in_time_matches }}</span> 场 (前3~后1小时)</p>
                 <p>✅ 成功解密线路: <span style="color: #198754; font-size: 18px;">{{ status.success_lines }}</span> 条</p>
             </div>
             <div>
