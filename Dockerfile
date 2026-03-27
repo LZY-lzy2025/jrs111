@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制运行代码
 COPY main.py .
 
-# 暴露 Web 后台端口
-EXPOSE 80
+# 暴露 Web 后台端口（默认 8080，可由 PORT 环境变量覆盖）
+EXPOSE 8080
 
 # 运行服务
 CMD ["python", "-u", "main.py"]

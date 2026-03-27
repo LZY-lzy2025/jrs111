@@ -382,4 +382,6 @@ if __name__ == "__main__":
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
-    app.run(host="0.0.0.0", port=80)
+    # 兼容容器平台分配端口（如 Render/Railway/Fly.io）
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
