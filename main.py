@@ -370,10 +370,10 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(OUTPUT_M3U_FILE), exist_ok=True)
     if not os.path.exists(OUTPUT_M3U_FILE):
         with open(OUTPUT_M3U_FILE, 'w', encoding='utf-8') as f:
-            f.write("#EXTM3U\n#EXTINF:-1,系统正在初始化抓取，请稍后(约2分钟)...\nhttp://127.0.0.1/loading.mp4\n")
+            f.write("#EXTM3U\n#EXTINF:-1,关注博客blog.204090.xyz\nhttps://blog.204090.xyz\n")
     if not os.path.exists(OUTPUT_TXT_FILE):
         with open(OUTPUT_TXT_FILE, 'w', encoding='utf-8') as f:
-            f.write("系统提示,#genre#\n初始化抓取中(约2分钟)...,http://127.0.0.1/loading.mp4\n")
+            f.write("系统提示,#genre#\n关注博客blog.204090.xyz,https://blog.204090.xyz\n")
 
     threading.Thread(target=generate_playlist, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
